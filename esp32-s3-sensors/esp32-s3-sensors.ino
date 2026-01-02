@@ -8,6 +8,9 @@
 #include <DNSServer.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <esp_wifi.h>
+#include <esp_sleep.h>
+#include <esp_system.h>
 
 Preferences  prefs;
 DNSServer    dnsServer;
@@ -44,6 +47,50 @@ String m_path;  // MQTT path
 HardwareSerial mhz19(1);  // UART1
 HardwareSerial zh03b(2);  // UART2
 SensirionI2cSht4x sht4x;  // I2C
+
+
+volatile bool     bootPressed   = false;
+volatile uint32_t bootPressTick = 0;
+bool              bootPressHandled = false;
+bool              otaWindowActive  = false;
+uint32_t          otaWindowUntil   = 0;
+
+const uint32_t OTA_TRIGGER_MS     = 1500;
+const uint32_t OTA_WINDOW_MS      = 1UL * 60UL * 1000UL;
+const uint32_t FACTORY_RESET_MS   = 5000;
+
+const uint32_t PUBLISH_INTERVAL_MS = 15000;
+const uint64_t PUBLISH_INTERVAL_US = (uint64_t)PUBLISH_INTERVAL_MS * 1000ULL;
+
+
+/* - - - - - RGB LED helpers - - - - - */
+static void rgbSet(uint8_t r, uint8_t g, uint8_t b) {
+  rgbLedWrite(LED_BUILTIN, r, g, b);
+}
+
+static void rgbOff() {
+  rgbSet(0, 0, 0);
+}
+
+static void rgbGreenOn() {
+  rgbSet(0, 64, 0);
+}
+
+static void rgbBlueFlash() {
+  rgbSet(0, 0, 64);
+  delay(30);
+  if (otaWindowActive) {
+    rgbGreenOn();
+  } else {
+    rgbOff();
+  }
+}
+
+static void rgbRedFlash() {
+  rgbSet(64, 0, 0);
+  delay(120);
+  rgbOff();
+}
 
 
 /* - - - - - AP and Wi-Fi connection stuff - - - - - */
@@ -141,6 +188,7 @@ int readCO2() {
   unsigned long t0 = millis();
   while (mhz19.available() < 9) {
     if (millis() - t0 > 1000) return -1;
+    delay(2);
   }
   for (int i = 0; i < 9; i++) resp[i] = mhz19.read();
   if (resp[0] != 0xFF || resp[1] != 0x86) return -2;
@@ -190,10 +238,44 @@ void connectWiFi() {
 }
 
 void connectMQTT() {
-  while (!mqtt.connected()) {
-    mqtt.connect(m_id.c_str(), m_user.c_str(), m_pass.c_str());
-    delay(1000);
+  static uint32_t lastAttempt = 0;
+  if (mqtt.connected()) return;
+  if (millis() - lastAttempt < 5000) return;
+  lastAttempt = millis();
+  mqtt.connect(m_id.c_str(), m_user.c_str(), m_pass.c_str());
+}
+
+
+/* - - - - - "BOOT" button helpers - - - - - */
+void IRAM_ATTR bootButtonISR() {
+  if (digitalRead(0) == LOW) {
+    bootPressed   = true;
+    bootPressTick = xTaskGetTickCountFromISR();
+  } else {
+    bootPressed = false;
   }
+}
+
+void startOtaWindow() {
+  if (!otaWindowActive) {
+    ArduinoOTA.begin();
+    otaWindowActive = true;
+    rgbGreenOn();
+#ifdef DEBUG
+    Serial.println("OTA window started");
+#endif
+  }
+  otaWindowUntil = millis() + OTA_WINDOW_MS;
+}
+
+void stopOtaWindow() {
+  if (!otaWindowActive) return;
+  ArduinoOTA.end();
+  otaWindowActive = false;
+  rgbOff();
+#ifdef DEBUG
+  Serial.println("OTA window ended");
+#endif
 }
 
 
@@ -201,7 +283,17 @@ void connectMQTT() {
 /* - - - - - SETUP - - - - - */
 void setup() {
   Serial.begin(115200);
+  pinMode(0, INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
+  rgbLedWrite(LED_BUILTIN, 0, 0, 0);
+  attachInterrupt(0, bootButtonISR, CHANGE);
   delay(1000);
+  setCpuFrequencyMhz(80);
+  btStop();
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    startOtaWindow();
+  }
+
 
 // Load saved config into global variables
   prefs.begin("connections", true);
@@ -230,6 +322,8 @@ void setup() {
   Serial.printf("Connecting to WiFi: %s\n", s_ssid.c_str());
 #endif
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   WiFi.begin(s_ssid.c_str(), s_pass.c_str());
 
   uint32_t t0 = millis();
@@ -272,15 +366,11 @@ void setup() {
   });
 #endif
 
-  ArduinoOTA.begin();
-#ifdef DEBUG
-  Serial.println("OTA ready");
-#endif
-
 // Sensors
   mhz19.begin(9600, SERIAL_8N1, MHZ_RX, MHZ_TX);
   zh03b.begin(9600, SERIAL_8N1, ZH_RX, ZH_TX);
 
+  Wire.setClock(100000);
   Wire.begin(SDA_PIN, SCL_PIN);
   sht4x.begin(Wire, SHT40_I2C_ADDR_44);
 
@@ -299,41 +389,56 @@ void setup() {
 #endif
 
   mqtt.setServer(m_host.c_str(), m_port);
+  mqtt.setKeepAlive(60);
   connectMQTT();
 }
 
 
 
-
 /* - - - - - LOOP - - - - - */
 void loop() {
-  ArduinoOTA.handle();
+  if (otaWindowActive) {
+    ArduinoOTA.handle();
+    if ((int32_t)(millis() - otaWindowUntil) >= 0) {
+      stopOtaWindow();
+    }
+  }
 
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
-  if (!mqtt.connected()) connectMQTT();
-  mqtt.loop();
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (!mqtt.connected()) {
+    connectMQTT();
+  } else {
+    mqtt.loop();
+  }
 
 // Reset device with pressing BOOT button for >5s
-  static uint32_t buttonTimer = 0;
-  if (digitalRead(0) == LOW) {
-    if (buttonTimer == 0) buttonTimer = millis();
-    if (millis() - buttonTimer > 5000) {
+  if (bootPressed) {
+    uint32_t heldMs = (xTaskGetTickCount() - bootPressTick) * portTICK_PERIOD_MS;
+    if (heldMs > FACTORY_RESET_MS) {
 #ifdef DEBUG
-      Serial.println("Factory Reset!");
+      rgbRedFlash();
+      Serial.println("Reset!");
 #endif
       WiFi.disconnect(true, true);
-      delay(500);
+      prefs.begin("connections", false);
+        prefs.clear();
+      prefs.end();
+      delay(200);
       ESP.restart();
     }
+    else if (!bootPressHandled && heldMs > OTA_TRIGGER_MS) {
+      startOtaWindow();
+      bootPressHandled = true;
+    }
   } else {
-    buttonTimer = 0;
+    bootPressHandled = false;
   }
 
 // Read sensors measurements
-  static uint32_t lastPublish = 0;
-  if (millis() - lastPublish > 20000) {
-    lastPublish = millis();
-
+  if (mqtt.connected()) {
     int co2 = readCO2();
     float temperature=0, humidity=0;
     readSHT40(temperature, humidity);
@@ -351,6 +456,29 @@ void loop() {
     // Publish
     char buf[256];
     serializeJson(doc, buf);
-    mqtt.publish(m_path.c_str(), buf);
+    bool sent = mqtt.publish(m_path.c_str(), buf);
+
+#ifdef DEBUG
+    Serial.print("Published: ");
+    Serial.println(buf);
+    if (!sent) {
+      Serial.println("MQTT publish failed!");
+    }
+    rgbBlueFlash();
+#endif
+
+    if (!otaWindowActive) {
+      mqtt.disconnect();
+      WiFi.mode(WIFI_OFF);
+      esp_wifi_stop();
+      delay(50);
+      esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+      esp_sleep_enable_timer_wakeup(PUBLISH_INTERVAL_US);
+      esp_light_sleep_start();
+      esp_wifi_start();
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(s_ssid.c_str(), s_pass.c_str());
+    }
   }
 }
